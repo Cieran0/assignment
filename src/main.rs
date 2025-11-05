@@ -214,6 +214,36 @@ fn parse_obj_file(path: &str) -> Result<ObjData, Box<dyn Error>> {
     Ok(obj_data)
 }
 
+fn normalize_vertices(vertices: &mut Vec<[f32; 3]>) {
+    if vertices.is_empty() {
+        return;
+    }
+
+    // Compute bounding box
+    let mut min = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut max = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+
+    for v in vertices.iter() {
+        let pos = Vec3::from(*v);
+        min = min.min(pos);
+        max = max.max(pos);
+    }
+
+    let center = (min + max) * 0.5;
+    let size = max - min;
+    let max_dim = size.x.max(size.y).max(size.z);
+
+    // Avoid division by zero
+    let scale = if max_dim > 0.0 { 2.0 / max_dim } else { 1.0 };
+
+    // Apply transformation: move to origin, then scale to [-1,1]
+    for v in vertices.iter_mut() {
+        let pos = Vec3::from(*v);
+        let normalized = (pos - center) * scale;
+        *v = normalized.to_array();
+    }
+}
+
 fn compile_shader(source: &str, shader_type: u32) -> Result<u32, String> {
     let shader = unsafe { gl::CreateShader(shader_type) };
     let c_source = std::ffi::CString::new(source).expect("Shader source must be valid UTF-8");
@@ -270,12 +300,118 @@ struct Camera {
     up: Vec3,
 }
 
+fn create_gear(
+    inner_radius: f32,
+    outer_radius: f32,
+    height: f32,
+    tooth_depth: f32,
+    num_teeth: usize, // number of teeth around the gear
+) -> ObjData {
+    let segments = 32;
+    let mut vertices = Vec::new();
+    let mut faces: Vec<[i32; 3]> = Vec::new();
+
+    // --- Inner and outer cylinder vertices ---
+    for i in 0..segments {
+        let angle = (i as f32) / (segments as f32) * std::f32::consts::TAU;
+        let cos = angle.cos();
+        let sin = angle.sin();
+
+        // Inner
+        vertices.push([inner_radius * cos, inner_radius * sin, 0.0]); // bottom
+        vertices.push([inner_radius * cos, inner_radius * sin, height]); // top
+
+        // Outer
+        vertices.push([outer_radius * cos, outer_radius * sin, 0.0]); // bottom
+        vertices.push([outer_radius * cos, outer_radius * sin, height]); // top
+    }
+
+    // --- Cylinder faces ---
+    for i in 0..segments {
+        let next = (i + 1) % segments;
+
+        let ibb = (i * 4) as i32;
+        let inn = (next * 4) as i32;
+
+        // Outer wall
+        faces.push([ibb + 2, inn + 2, inn + 3]);
+        faces.push([ibb + 2, inn + 3, ibb + 3]);
+
+        // Inner wall (hole) - reverse winding
+        faces.push([ibb + 1, inn + 1, inn]);
+        faces.push([ibb + 1, inn, ibb]);
+        
+        // Top cap
+        faces.push([ibb + 1, inn + 1, inn + 3]);
+        faces.push([ibb + 1, inn + 3, ibb + 3]);
+
+        // Bottom cap
+        faces.push([ibb, inn, inn + 2]);
+        faces.push([ibb, inn + 2, ibb + 2]);
+    }
+
+    // --- Teeth ---
+    for t in 0..num_teeth {
+        let angle_offset = (t as f32) / (num_teeth as f32) * std::f32::consts::TAU;
+        let cos_a = angle_offset.cos();
+        let sin_a = angle_offset.sin();
+
+        let tooth_tip_radius = outer_radius + tooth_depth;
+
+        // base tooth vertices (local, unrotated)
+        let local = [
+            [outer_radius, 0.0, 0.0],
+            [outer_radius, tooth_depth, 0.0],
+            [tooth_tip_radius, 0.0, 0.0],
+            [outer_radius, 0.0, height],
+            [outer_radius, tooth_depth, height],
+            [tooth_tip_radius, 0.0, height],
+        ];
+
+        let start_idx = vertices.len() as i32;
+
+        // rotate and add vertices
+        for v in &local {
+            let x = v[0] * cos_a - v[1] * sin_a;
+            let y = v[0] * sin_a + v[1] * cos_a;
+            let z = v[2];
+            vertices.push([x, y, z]);
+        }
+
+        // add faces (same as single tooth, offset by start_idx)
+        faces.push([start_idx, start_idx + 1, start_idx + 2]);
+        faces.push([start_idx + 3, start_idx + 5, start_idx + 4]);
+
+        faces.push([start_idx, start_idx + 3, start_idx + 4]);
+        faces.push([start_idx, start_idx + 4, start_idx + 1]);
+
+        faces.push([start_idx + 1, start_idx + 4, start_idx + 5]);
+        faces.push([start_idx + 1, start_idx + 5, start_idx + 2]);
+
+        faces.push([start_idx + 2, start_idx + 5, start_idx + 3]);
+        faces.push([start_idx + 2, start_idx + 3, start_idx]);
+    }
+
+    ObjData { vertices, faces }
+}
+
+
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut mouse_pressed = false;
     let mut last_mouse_pos: Option<(f64, f64)> = None;
     const MOUSE_SENSITIVITY: f32 = 0.002;
 
-    let obj_data = parse_obj_file("funky.obj")?;
+    let mut obj_data = parse_obj_file("escape.obj")?;
+    normalize_vertices(&mut obj_data.vertices);
+
+    let gear_obj = create_gear(
+        0.3,
+        0.5,
+        0.1,
+        0.15,
+        20,
+    );
 
     let mut glfw = glfw::init(glfw::fail_on_errors).unwrap();
     glfw.window_hint(glfw::WindowHint::ContextVersion(4, 6));
@@ -306,6 +442,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let (main_vao, main_vertex_count) = obj_to_opengl(obj_data);
     let (light_vao, light_index_count) = create_light_cube();
+    let (gear_vao, gear_vertex_count) = obj_to_opengl(gear_obj);
 
     let mut camera = Camera {
         position: Vec3::new(0.0, 0.0, 3.0),
@@ -432,6 +569,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             gl::BindVertexArray(light_vao);
             gl::DrawElements(gl::TRIANGLES, light_index_count, gl::UNSIGNED_INT, std::ptr::null());
+
+            let gear_model = Mat4::from_rotation_z(0.0) * Mat4::from_translation(Vec3::new(0.0, -0.5, 0.0));
+            let gear_normal_matrix = Mat3::from_mat4(gear_model).inverse().transpose();
+            gl::UniformMatrix4fv(model_loc, 1, gl::FALSE, gear_model.to_cols_array().as_ptr());
+            gl::UniformMatrix3fv(normal_loc, 1, gl::FALSE, gear_normal_matrix.to_cols_array().as_ptr());
+            gl::Uniform1ui(emitmode_loc, 0);
+
+            gl::BindVertexArray(gear_vao);
+            gl::DrawArrays(gl::TRIANGLES, 0, gear_vertex_count);
         }
 
         window.swap_buffers();
